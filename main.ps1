@@ -1,7 +1,5 @@
 
 param()
-# TODO reuse keystore from previous build if it exists
-
 
 #region java setup
 <#
@@ -132,7 +130,7 @@ get a list of all attached ADB devices
 path to the adb binary
 
 .OUTPUTS
-an array of device names
+an array of attached devices [{name,kind}]
 #>
 function Get-ADBDevices(
     [string] [ValidateNotNullOrEmpty()] $ADBExe
@@ -162,12 +160,15 @@ function Get-ADBDevices(
     $devices = @()
     ("$stdout `n $stderr").Split(@("`r`n", "`r", "`n"), [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object {
         # on each line, check for output format
-        # TODO: the regex does not detect device names, for example 'emulator-5554 device' does not match
         Write-Debug "parse line '$_'"
-        if ($_ -match "(.+)  +device") {
+        if ($_.Trim() -match "^([\w-]+)\s*((?:device)|(?:unauthorized)|(?:offline))$") {
             $name = $Matches[1]
-            if (-not [string]::IsNullOrWhiteSpace($name)) {
-                $devices += $name
+            $kind = $Matches[2]
+            if ((-not [string]::IsNullOrWhiteSpace($name)) -and (-not [string]::IsNullOrWhiteSpace($kind))) {
+                $devices += [PSCustomObject]@{
+                    name = $name
+                    kind = $kind
+                }
             }
         }
     }
@@ -282,6 +283,12 @@ function Get-ReVancedLatest(
     [string][ValidateNotNullOrEmpty()] $RootDirectory,
     [string][ValidateNotNullOrEmpty()] $Vendor = "revanced"
 ) {
+    # helper function to log tag of version to console from pipeline
+    function Write-ReleaseTag([Parameter(ValueFromPipeline)] [ValidateNotNull()] $ReleaseInfo) {
+        Write-Host ($ReleaseInfo.tag_name)
+        return $ReleaseInfo
+    }
+
     # prepare root dir
     if (-not (Test-Path -Path $RootDirectory -PathType Container)) {
         New-Item -Path $RootDirectory -ItemType Directory -ErrorAction Stop | Out-Null
@@ -293,18 +300,21 @@ function Get-ReVancedLatest(
     $patchesPath = [System.IO.Path]::Combine($RootDirectory, "revanced-patches.jar")
 
     # download revanced cli, integrations and patches
-    Write-Information "downloading $Vendor/revanced-cli..."
+    Write-Host "downloading $Vendor/revanced-cli... " -NoNewline
     Get-GithubReleaseInfo -Repository "$Vendor/revanced-cli" `
+    | Write-ReleaseTag `
     | Find-GithubReleaseAssetUrl -Pattern "revanced-cli.*\.jar" `
     | Save-FileTo -FilePath $cliPath
 
-    Write-Information "downloading $Vendor/revanced-integrations..."
+    Write-Host "downloading $Vendor/revanced-integrations... " -NoNewline
     Get-GithubReleaseInfo -Repository "$Vendor/revanced-integrations" `
+    | Write-ReleaseTag `
     | Find-GithubReleaseAssetUrl -Pattern ".*\.apk" `
     | Save-FileTo -FilePath $integrationsPath
 
-    Write-Information "downloading $Vendor/revanced-patches..."
+    Write-Host "downloading $Vendor/revanced-patches... " -NoNewline
     Get-GithubReleaseInfo -Repository "$Vendor/revanced-patches" `
+    | Write-ReleaseTag `
     | Find-GithubReleaseAssetUrl -Pattern "revanced-patches.*\.jar" `
     | Save-FileTo -FilePath $patchesPath
 
@@ -503,15 +513,16 @@ function Invoke-ApplyPatches(
     [string] [ValidateNotNullOrEmpty()] $TempDirectory,
     [ValidateNotNull()] $ReVancedPaths,
     [string[]] [ValidateNotNull()] $ExcludedPatches,
-    [string] $DeployDeviceName = $null
+    [string] $DeployDeviceName = $null,
+    [string] $KeystorePath = $null
 ) {    
     # create args
-    $exclArgs = (@($ExcludedPatches | ForEach-Object { "-e $_" }) -join " ")
-    if ([string]::IsNullOrWhiteSpace($DeployDeviceName)) {
-        $allArgs = $exclArgs
+    $allArgs = (@($ExcludedPatches | ForEach-Object { "-e $_" }) -join " ")
+    if (-not [string]::IsNullOrWhiteSpace($DeployDeviceName)) {
+        $allArgs = "$allArgs --deploy-on $DeployDeviceName"
     }
-    else {
-        $allArgs = "$exclArgs --deploy-on $DeployDeviceName"
+    if (-not [string]::IsNullOrWhiteSpace($KeystorePath)) {
+        $allArgs = "$allArgs --keystore `"$KeystorePath`""
     }
 
     # create cli process with -
@@ -528,21 +539,43 @@ function Invoke-ApplyPatches(
     $stdout = $proc.StandardOutput.ReadToEnd()
     $stderr = $proc.StandardError.ReadToEnd()
     Write-Information @"
+
 ReVanced-CLI finished with exit code $($proc.ExitCode):
+-- Commandline --
+$($proc.StartInfo.Arguments)
+
+
+-- STDOUT --
 $stdout
 
----
 
+-- STDERR --
 $stderr
+
 
 "@
 }
 #endregion
 
+<#
+.SYNOPSIS
+guide the user through the patching process
 
-# TODO documentation
-function Start-ReVancedGuidedPatching(
+.PARAMETER JavaExePath
+path of the java.exe to use
+
+.PARAMETER ADBExe
+path to the adb binary
+
+.PARAMETER TempDirectory
+path to the temporary directory the cli should use
+
+.PARAMETER ReVancedPaths
+revanced binaries paths. {cli,patches,integrations}
+#>
+function Start-GuidedPatching(
     [string] [ValidateNotNullOrEmpty()] $JavaExePath,
+    [string] [ValidateNotNullOrEmpty()] $ADBExe,
     [string] [ValidateNotNullOrEmpty()] $TempDirectory,
     [ValidateNotNull()] $ReVancedPaths
 ) {
@@ -550,6 +583,7 @@ function Start-ReVancedGuidedPatching(
     # get base APK from user
     # check: not empty input + exists + is .apk file
     Write-Host @"
+
 Hey there! 
 Before we can get started patching, you'll have to provide a base apk to patch. 
 To find the right apk, use your preferred search engine (like google, duckduckgo or even bing) and search for something like 'youtube apk download'.
@@ -588,6 +622,7 @@ Once you're done downloading, drag&drop the .APK file into this window.
     $microGPatchName = "microg-support"
     if ($excludePatches -contains $microGPatchName) {
         Write-Host @"
+
 It looks like you excluded the '$microGPatchName' patch! 
 This is fine as long as your phone is rooted.
 If installation fails, please retry with the '$microGPatchName' patch included
@@ -595,30 +630,20 @@ If installation fails, please retry with the '$microGPatchName' patch included
 "@ -ForegroundColor Red
     }
 
-    # TODO get adb devices, let user choose on what device to install
+    # let user provide a keystore file
     Write-Host @"
-we're almost ready for patching. 
-But before that, do you wish to directly install ReVanced on your phone?
-(You'll need to connect your phone to the PC and enable ADB)
-"@
-    if ((Read-Host -Prompt "Deploy on device? (y/N)").Trim().ToLower().StartsWith("y")) {
-        # prompt the user to connect their phone and enable usb debugging
-        Write-Host @"
-Ok, then please connect your phone to your PC using a USB- Cable. 
-If you don't have USB Debugging enabled, please do so now. 
-You can find the setting in the developer options. For more detailed instructions, please use your favorite search engine.
 
-After you're done connecting your phone, please press <ENTER>
+do you have a keystore file you wish to use?
+If you don't have one, just press <ENTER>
+(ReVanced automatically creates one when patching, so if you still have that one drag&drop it here)
 "@
-        Read-Host -Prompt "Please connect phone" | Out-Null
-
-        # get available devices and let user choose the right phone
-        Write-Host "please select the phone to install on. You may only select ONE device"
-        $deployTarget = (Get-ADBDevices | Out-GridView -Title "Select Deploy Target" -PassThru)[0].id
+    $keystorePath = Read-Host -Prompt "Keystore File"
+    if (-not (Test-Path -Path $keystorePath -PathType Leaf)) {
+        $keystorePath = $null
     }
-    else {
-        $deployTarget = $null
-    }
+    
+    # let user choose on what device to install on
+    $deployTarget = Start-GuidedDeviceSelection -ADBExe $ADBExe
 
     # start patching
     Write-Host "patching..."
@@ -628,27 +653,94 @@ After you're done connecting your phone, please press <ENTER>
         -TempDirectory $TempDirectory `
         -ExcludedPatches $excludePatches `
         -OutputApkPath $outputApkPath `
-        -DeployDeviceName $deployTarget
+        -DeployDeviceName $deployTarget `
+        -KeystorePath $keystorePath
 }
 
+<#
+.SYNOPSIS
+guide the user through adb device selection
 
+.PARAMETER ADBExe
+path to the adb binary
+
+.OUTPUTS
+the selected device name, or $null if none selected
+#>
+function Start-GuidedDeviceSelection(
+    [string] [ValidateNotNullOrEmpty()] $ADBExe
+) {
+    Write-Host @"
+
+we're almost ready for patching. 
+But before that, do you wish to directly install ReVanced on your phone?
+(You'll need to connect your phone to the PC and enable ADB)
+"@
+    if ((Read-Host -Prompt "Deploy on device? (y/N)").Trim().ToLower().StartsWith("y")) {
+        # prompt the user to connect their phone and enable usb debugging
+        Write-Host @"
+
+Ok, then please connect your phone to your PC using a USB- Cable. 
+If you don't have USB Debugging enabled, please do so now. 
+You can find the setting in the developer options. For more detailed instructions, please use your favorite search engine.
+
+Once you connected your phone, the guide will continue automatically
+"@
+    
+        # poll for attached devices, only stop if there is at least one device that is authorized
+        Write-Host "Waiting for device" -NoNewline
+        while ($true) {
+            # get devices
+            Start-Sleep -Seconds 2
+            Write-Host "." -NoNewline
+            $adbDevices = @( Get-ADBDevices -ADBExe $ADBExe )
+            
+            # if there is at least one device that is online, end the wait
+            $authDevices = @( $adbDevices | Where-Object { $_.kind -ieq "device" } )
+            if ($authDevices.Count -gt 0) {
+                $targetName = $authDevices[0].name
+                Write-Host "`nfound device $targetName"
+                return $targetName
+            }
+
+            # if there are unauthorized devices, tell user to authorize
+            #if (@( $adbDevices | Where-Object { $_.kind -ine "device" } ).Count -gt 0) {
+            #    Write-Host "`nplease authorize USB Debugging"
+            #}
+        }
+    }
+        
+    return $null
+}
 
 function Main() {
-    Get-ADBDevices -ADBExe ".\adb.exe" | Out-GridView
-    return
+    # adb ships with the script, check if its actually present
+    $adbExePath = [System.IO.Path]::Combine($PSScriptRoot, "adb.exe")
+    if (-not (Test-Path -Path $adbExePath -PathType Leaf)) {
+        throw "could not find adb.exe"
+    }
 
     # setup azul jdk
     Write-Information "setup jdk..."
-    $javaExePath = Test-AzulJDKSetup -RootDirectory ([System.IO.Path]::Combine($PSScriptRoot, ".data", "jdk")) -AzulVersion "java-18-sts"
+    $javaExePath = Test-AzulJDKSetup -RootDirectory ([System.IO.Path]::Combine($PSScriptRoot, "data", "jdk")) -AzulVersion "java-18-sts"
 
     # setup revanced binaries
     Write-Information "setup revanced..."
-    $revancedPaths = Get-ReVancedLatest -RootDirectory ([System.IO.Path]::Combine($PSScriptRoot, ".data", "revanced"))
+    $revancedPaths = Get-ReVancedLatest -RootDirectory ([System.IO.Path]::Combine($PSScriptRoot, "data", "revanced"))
 
     # start guided patching
     Write-Information "start patching..."
-    Start-ReVancedGuidedPatching -JavaExePath $javaExePath -ReVancedPaths $revancedPaths -TempDirectory ([System.IO.Path]::Combine($PSScriptRoot, ".data", "temp"))
+    Start-GuidedPatching -JavaExePath $javaExePath -ADBExe $adbExePath -ReVancedPaths $revancedPaths -TempDirectory ([System.IO.Path]::Combine($PSScriptRoot, "data", "temp"))
+
+    # finished
+    Write-Host @"
+
+Finished!
+
+
+
+"@
 }
-$DebugPreference = "continue"
+#$DebugPreference = "continue"
 $InformationPreference = "continue"
 Main

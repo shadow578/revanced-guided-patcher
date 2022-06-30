@@ -1,4 +1,4 @@
 *.apk
 *.zip
 *.keystore
-.data/
+data/
