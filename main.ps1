@@ -505,6 +505,9 @@ a array of the patches to exclude
 
 .PARAMETER DeployDeviceName
 adb name of the device to deploy on. if null, will not deploy
+
+.OUTPUTS
+a reference to the current cli process
 #>
 function Invoke-ApplyPatches(
     [string] [ValidateNotNullOrEmpty()] $JavaExePath,
@@ -533,27 +536,9 @@ function Invoke-ApplyPatches(
         -ReVancedPaths $ReVancedPaths `
         -ExtraArguments $allArgs
     
-    # start the process and capture output
+    # start the process
     $proc.Start() | Out-Null
-    $proc.WaitForExit()
-    $stdout = $proc.StandardOutput.ReadToEnd()
-    $stderr = $proc.StandardError.ReadToEnd()
-    Write-Information @"
-
-ReVanced-CLI finished with exit code $($proc.ExitCode):
--- Commandline --
-$($proc.StartInfo.Arguments)
-
-
--- STDOUT --
-$stdout
-
-
--- STDERR --
-$stderr
-
-
-"@
+    return $proc
 }
 #endregion
 
@@ -638,7 +623,7 @@ If you don't have one, just press <ENTER>
 (ReVanced automatically creates one when patching, so if you still have that one drag&drop it here)
 "@
     $keystorePath = Read-Host -Prompt "Keystore File"
-    if (-not (Test-Path -Path $keystorePath -PathType Leaf)) {
+    if (([string]::IsNullOrWhiteSpace($keystorePath)) -or (-not (Test-Path -Path $keystorePath -PathType Leaf))) {
         $keystorePath = $null
     }
     
@@ -654,7 +639,8 @@ If you don't have one, just press <ENTER>
         -ExcludedPatches $excludePatches `
         -OutputApkPath $outputApkPath `
         -DeployDeviceName $deployTarget `
-        -KeystorePath $keystorePath
+        -KeystorePath $keystorePath `
+    | Write-PatchingStatus
 }
 
 <#
@@ -711,6 +697,41 @@ Once you connected your phone, the guide will continue automatically
     }
         
     return $null
+}
+
+<#
+.SYNOPSIS
+Writes the process output to the console in real-time
+
+.PARAMETER Process
+the process to write the status of
+#>
+function Write-PatchingStatus(
+    [System.Diagnostics.Process] [Parameter(ValueFromPipeline)] [ValidateNotNull()] $Process 
+) {
+    # print process information
+    Write-Host "`n`n---- Patching Log ----"
+    Write-Host @"
+
+---- Commandline ----
+$($Process.StartInfo.FileName) $($Process.StartInfo.Arguments)
+
+---- Patching Log ----
+
+"@
+
+    #TODO currently only outputs stderr output
+    do {
+        Write-Host $Process.StandardError.ReadLine()
+    }
+    while (-not $Process.HasExited)
+
+    Write-Host @"
+
+---- Exit Code ----
+$($Process.ExitCode)
+
+"@
 }
 
 function Main() {
